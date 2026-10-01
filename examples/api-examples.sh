@@ -51,6 +51,64 @@ publish data-toolkit 2.4.1 '{"plugin":"data-toolkit","version":"2.4.1",
   "runtimes":[{"name":"python","spec":">=3.9"}],
   "dependencies":[{"plugin":"numpy","spec":">=1.20,<2"}]}' "dtk-2.4.1"
 
+# 1b) 离线批次发布：相互依赖的多个插件一次提交，只产生一个目录修订
+echo ">>> 批次发布 lab-batch-demo：pkg-core + pkg-app（app 依赖 core）"
+core_pkg="$tmpdir/pkg-core-1.0.0.bin"; printf 'pkg-core-1.0.0' > "$core_pkg"
+app_pkg="$tmpdir/pkg-app-1.0.0.bin"; printf 'pkg-app-1.0.0' > "$app_pkg"
+CORE_SHA="$(sha256_file "$core_pkg")"; APP_SHA="$(sha256_file "$app_pkg")"
+ITEMS="$tmpdir/batch-items.json"
+cat > "$ITEMS" <<JSON
+[
+  {"plugin":"pkg-core","version":"1.0.0","sha256":"$CORE_SHA","runtimes":[],"dependencies":[],"conflicts":[]},
+  {"plugin":"pkg-app","version":"1.0.0","sha256":"$APP_SHA",
+   "dependencies":[{"plugin":"pkg-core","spec":">=1"}],"runtimes":[],"conflicts":[]}
+]
+JSON
+curl -fsS -X POST "${AUTH[@]}" \
+  -F "items=<$ITEMS;type=application/json" \
+  -F "package:0=@${core_pkg};filename=pkg-core-1.0.0.bin" \
+  -F "package:1=@${app_pkg};filename=pkg-app-1.0.0.bin" \
+  "$API/batches/lab-batch-demo/publish" | tee "$tmpdir/batch1.json" | python3 -m json.tool
+BATCH_REV="$(python3 -c 'import json;print(json.load(open("'$tmpdir'/batch1.json"))["revision"])')"
+
+# 相同标识 + 相同内容重试：cached=true、同一修订号，不产生新修订
+echo ">>> 批次重试（应 cached=true，修订号不变 $BATCH_REV）"
+curl -fsS -X POST "${AUTH[@]}" \
+  -F "items=<$ITEMS;type=application/json" \
+  -F "package:0=@${core_pkg};filename=pkg-core-1.0.0.bin" \
+  -F "package:1=@${app_pkg};filename=pkg-app-1.0.0.bin" \
+  "$API/batches/lab-batch-demo/publish" \
+  | python3 -c 'import json,sys;b=json.load(sys.stdin);print("cached=%s revision=%s"%(b["cached"],b["revision"]))'
+
+# 批次内成员在该修订同时可见：在 $BATCH_REV 求解 pkg-app 即选到二者
+echo ">>> 在批次修订 $BATCH_REV 上求解 pkg-app（两成员同时可见）"
+curl -fsS -X POST "${AUTH[@]}" -H 'Content-Type: application/json' \
+  -d "{\"revision\":$BATCH_REV,\"targets\":{\"pkg-app\":\"\"}}" \
+  "$API/solutions" | python3 -c 'import json,sys;s=json.load(sys.stdin);print("install_order=",s["install_order"])'
+
+# 相同标识、内容不同：409 冲突（这里把 app 版本改成 2.0.0）
+echo ">>> 相同批次标识提交不同内容（应 409）"
+app2_pkg="$tmpdir/pkg-app-2.0.0.bin"; printf 'pkg-app-2.0.0' > "$app2_pkg"
+BAD_ITEMS="$tmpdir/batch-items-bad.json"
+python3 - "$APP_SHA" "$(sha256_file "$app2_pkg")" "$BAD_ITEMS" <<'PY'
+import json,sys
+core_sha, app_sha, out = sys.argv[1], sys.argv[2], sys.argv[3]
+json.dump([
+  {"plugin":"pkg-core","version":"1.0.0","sha256":core_sha},
+  {"plugin":"pkg-app","version":"2.0.0","sha256":app_sha}],
+  open(out,"w"))
+PY
+curl -sS -X POST "${AUTH[@]}" \
+  -F "items=<$BAD_ITEMS;type=application/json" \
+  -F "package:0=@${core_pkg};filename=pkg-core-1.0.0.bin" \
+  -F "package:1=@${app2_pkg};filename=pkg-app-2.0.0.bin" \
+  "$API/batches/lab-batch-demo/publish" | python3 -m json.tool || true
+
+# 回查批次结果
+echo ">>> 查询批次 lab-batch-demo"
+curl -fsS "$API/batches/lab-batch-demo" \
+  | python3 -c 'import json,sys;b=json.load(sys.stdin);print("revision=%s members=%d"%(b["revision"],len(b["members"])))'
+
 # 2) 求解：Python 3.11 + 最新 data-toolkit -> 应选 data-toolkit 3.0.0 / numpy 2.1.0
 echo ">>> 求解（python 3.11，目标 data-toolkit 最新）"
 curl -fsS -X POST "${AUTH[@]}" -H 'Content-Type: application/json' \

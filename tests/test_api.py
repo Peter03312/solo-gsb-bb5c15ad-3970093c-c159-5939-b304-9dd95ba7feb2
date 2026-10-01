@@ -15,6 +15,7 @@ import io
 import os
 import sys
 import tempfile
+import traceback
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -88,6 +89,228 @@ class ApiTests(unittest.TestCase):
         if expect is not None:
             self.assertEqual(resp.status_code, expect, resp.text)
         return resp
+
+    def _batch_meta(self, plugin, version, payload, deps=None, rts=None,
+                    sha=None):
+        body = payload if isinstance(payload, bytes) else payload.encode()
+        meta = {
+            "plugin": plugin, "version": version,
+            "sha256": sha or hashlib.sha256(body).hexdigest(),
+            "dependencies": deps or [], "runtimes": rts or [], "conflicts": [],
+        }
+        return meta, body
+
+    def batch_publish(self, batch_id, members, expect=None):
+        """members: [(meta_dict, payload_bytes), ...]，按下标提交安装包。"""
+        metas = [m for m, _ in members]
+        files = {"items": (None, _json(metas), "application/json")}
+        for i, (_, body) in enumerate(members):
+            key = "package" if len(members) == 1 else f"package:{i}"
+            files[key] = (f"pkg{i}.bin", io.BytesIO(body),
+                          "application/octet-stream")
+        resp = self.client.post(f"/api/v1/batches/{batch_id}/publish",
+                                files=files)
+        if expect is not None:
+            self.assertEqual(resp.status_code, expect, resp.text)
+        return resp
+
+    def _package_files(self):
+        out = []
+        for dp, _, fns in os.walk(self.tmp):
+            out.extend(os.path.join(dp, f) for f in fns
+                       if not f.startswith(".tmp"))
+        return out
+
+    # -------------------------------------------------- 批次发布（离线交付）
+    def test_batch_publish_single_revision_and_simultaneous_visibility(self):
+        members = [
+            self._batch_meta("bz-lib", "1.0.0", b"lib",
+                             rts=[{"name": "python", "spec": ">=3.10"}]),
+            self._batch_meta("bz-app", "1.0.0", b"app",
+                             deps=[{"plugin": "bz-lib", "spec": ">=1"}]),
+        ]
+        r = self.batch_publish("batch-1", members, expect=201)
+        body = r.json()
+        self.assertFalse(body["cached"])
+        self.assertEqual(len(body["members"]), 2)
+        # 整批只产生一个修订，两成员共享该修订并同时可见
+        revs = {m["published_revision"] for m in body["members"]}
+        self.assertEqual(revs, {body["revision"]})
+        rev = body["revision"]
+        # 修订之前（rev-1）两个成员都不可见；修订之上同时可见
+        before = self.client.get(f"/api/v1/plugins?revision={rev - 1}").json()
+        self.assertEqual(before["plugins"], {})
+        at = self.client.get(f"/api/v1/plugins?revision={rev}").json()
+        self.assertEqual(at["plugins"],
+                         {"bz-app": ["1.0.0"], "bz-lib": ["1.0.0"]})
+        # 下载与求解在该修订上即取即用
+        sol = self.client.post("/api/v1/solutions",
+                               json={"targets": {"bz-app": ""}}).json()
+        self.assertEqual(sol["revision"], rev)
+        self.assertEqual(sol["install_order"], ["bz-lib", "bz-app"])
+
+    def test_batch_retry_same_id_same_content_returns_original(self):
+        members = [self._batch_meta("id-a", "1.0.0", b"a"),
+                   self._batch_meta("id-b", "1.0.0", b"b")]
+        r1 = self.batch_publish("idem-1", members, expect=201)
+        r2 = self.batch_publish("idem-1", members, expect=200)
+        b1, b2 = r1.json(), r2.json()
+        self.assertTrue(b2["cached"])
+        self.assertEqual(b2["revision"], b1["revision"])
+        self.assertEqual(b2["content_hash"], b1["content_hash"])
+        self.assertEqual(b2["members"], b1["members"])
+        # 重试不产生新修订：仍是第 1 号修订
+        latest = self.client.get("/api/v1/revisions").json()
+        self.assertEqual([x["revision"] for x in latest], [1, 0])
+        g = self.client.get("/api/v1/batches/idem-1")
+        self.assertEqual(g.status_code, 200)
+        self.assertEqual(g.json()["revision"], b1["revision"])
+
+    def test_batch_same_id_different_content_conflict(self):
+        m1 = [self._batch_meta("cf-x", "1.0.0", b"x"),
+              self._batch_meta("cf-y", "1.0.0", b"y")]
+        self.batch_publish("cf-id", m1, expect=201)
+        m2 = [self._batch_meta("cf-x", "1.0.0", b"x"),
+              self._batch_meta("cf-y", "1.1.0", b"y-different")]
+        r = self.batch_publish("cf-id", m2, expect=409)
+        self.assertIn("不同内容", r.json()["detail"])
+        # 冲突未产生新修订，cf-y 1.1.0 不可见也无包
+        latest = self.client.get("/api/v1/revisions").json()
+        self.assertEqual([x["revision"] for x in latest], [1, 0])
+
+    def test_batch_duplicate_plugin_version_within_batch_rejected(self):
+        members = [self._batch_meta("dup-z", "1.0.0", b"z1"),
+                   self._batch_meta("dup-z", "1.0.0", b"z2")]
+        before = set(self._package_files())
+        r = self.batch_publish("dup-batch", members, expect=422)
+        self.assertIn("重复", r.json()["detail"])
+        # 校验在落盘之前：包目录无新增
+        self.assertEqual(set(self._package_files()), before)
+
+    def test_batch_bad_sha256_makes_whole_batch_invisible_without_leftovers(self):
+        before = set(self._package_files())
+        members = [
+            self._batch_meta("bad1", "1.0.0", b"good"),
+            self._batch_meta("bad2", "1.0.0", b"bad", sha="0" * 64),
+        ]
+        r = self.batch_publish("bad-sha-batch", members, expect=422)
+        self.assertIn("摘要不符", r.json()["detail"])
+        # 整批不可见：没有任何修订、版本、包文件
+        latest = self.client.get("/api/v1/revisions").json()
+        self.assertEqual([x["revision"] for x in latest], [0])
+        self.assertEqual(set(self._package_files()), before)
+
+    def test_batch_conflict_with_existing_version_is_invisible_no_leftovers(self):
+        # 单版本发布先占用 keep==1.0.0
+        self.publish("keep", "1.0.0", b"existing", expect=201)
+        before = set(self._package_files())
+        # 批次改写既有版本 + 一个全新成员：整批失败，新成员包不得遗留
+        members = [
+            self._batch_meta("keep", "1.0.0", b"existing"),
+            self._batch_meta("brand-new", "1.0.0", b"fresh-payload"),
+        ]
+        r = self.batch_publish("collide-batch", members, expect=409)
+        self.assertIn("不可改写", r.json()["detail"])
+        after = set(self._package_files())
+        self.assertEqual(before, after)  # 既有包保留，失败批次未新增文件
+        g = self.client.get("/api/v1/plugins/brand-new/versions/1.0.0")
+        self.assertEqual(g.status_code, 404)
+
+    def test_batch_single_item_uses_bare_package_field(self):
+        meta, body = self._batch_meta("solo", "1.0.0", b"solo-payload")
+        r = self.client.post("/api/v1/batches/solo-batch/publish", files={
+            "items": (None, _json([meta]), "application/json"),
+            "package": ("solo.bin", io.BytesIO(body),
+                        "application/octet-stream"),
+        })
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(r.json()["revision"], 1)
+
+    def test_batch_missing_and_misindexed_packages_rejected(self):
+        metas = [self._batch_meta("p1", "1.0.0", b"1")[0],
+                 self._batch_meta("p2", "1.0.0", b"2")[0]]
+        # 下标不连续
+        files = {"items": (None, _json(metas), "application/json"),
+                 "package:0": ("a.bin", io.BytesIO(b"1"),
+                               "application/octet-stream"),
+                 "package:2": ("b.bin", io.BytesIO(b"2"),
+                               "application/octet-stream")}
+        r = self.client.post("/api/v1/batches/misidx/publish", files=files)
+        self.assertEqual(r.status_code, 400, r.text)
+        # 缺 items
+        r = self.client.post("/api/v1/batches/noitems/publish", files={
+            "package": ("a.bin", io.BytesIO(b"1"),
+                        "application/octet-stream")})
+        self.assertEqual(r.status_code, 400, r.text)
+
+    def test_batch_single_publish_still_compatible_after_batch(self):
+        members = [self._batch_meta("mix-lib", "1.0.0", b"l")]
+        self.batch_publish("mix-batch", members, expect=201)
+        # 批次后，单版本发布照常工作并只再产生一个修订
+        r = self.publish("mix-tool", "1.0.0", b"t")
+        self.assertEqual(r.status_code, 201)
+        self.assertEqual(r.json()["published_revision"], 2)
+
+    def test_batch_concurrent_same_id_yields_one_revision(self):
+        import threading
+        from fastapi.testclient import TestClient as _TestClient
+        from sqlalchemy import create_engine, event
+        from app import database
+        from app.main import app as _app, init_db as _init_db
+        dbdir = tempfile.mkdtemp()
+        dbpath = os.path.join(dbdir, "conc.db")
+        batch_uid = os.path.basename(dbdir)
+        engine = create_engine(
+            f"sqlite+pysqlite:///{dbpath}",
+            connect_args={"check_same_thread": False, "timeout": 30})
+
+        @event.listens_for(engine, "connect")
+        def _busy(dbapi_con, _):
+            dbapi_con.cursor().execute("PRAGMA busy_timeout=30000")
+
+        database.engine = engine
+        database.SessionLocal.configure(bind=engine)
+        _init_db()
+
+        barrier = threading.Barrier(5)
+        results: list = []
+        errors: list = []
+        lock = threading.Lock()
+
+        def worker():
+            try:
+                client = _TestClient(_app)
+                meta, body = self._batch_meta("cp", "1.0.0", b"cp-payload")
+                files = {"items": (None, _json([meta]), "application/json"),
+                         "package": ("cp.bin", io.BytesIO(body),
+                                     "application/octet-stream")}
+                barrier.wait()
+                resp = client.post(f"/api/v1/batches/conc-{batch_uid}/publish",
+                                   files=files)
+                with lock:
+                    results.append(resp)
+            except BaseException:
+                with lock:
+                    errors.append(traceback.format_exc())
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertFalse(errors, "".join(errors))
+        statuses = sorted(r.status_code for r in results)
+        self.assertEqual(statuses[0], 200)
+        self.assertEqual(statuses[-1], 201)
+        revisions = {r.json()["revision"] for r in results}
+        self.assertEqual(revisions, {1})
+        self.assertEqual(sum(1 for r in results if not r.json()["cached"]), 1)
+        latest = self.client.get("/api/v1/revisions").json()
+        self.assertEqual([x["revision"] for x in latest], [1, 0])
+        dl = self.client.get("/api/v1/plugins/cp/versions/1.0.0/download")
+        self.assertEqual(dl.status_code, 200)
+        self.assertEqual(dl.content, b"cp-payload")
 
     # ------------------------------------------------------------ tests
     def test_health_and_root(self):

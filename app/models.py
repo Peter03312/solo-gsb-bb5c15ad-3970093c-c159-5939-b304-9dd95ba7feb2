@@ -46,9 +46,27 @@ class CatalogRevision(Base):
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class PublishBatch(Base):
+    """一次成功的批次发布（幂等登记表）。
+
+    ``batch_id`` 唯一：并发重试同一标识时由数据库序列化，只允许一个事务
+    产生修订；``content_hash`` 记录提交时的成员内容，标识相同而内容不同
+    直接判冲突。整批只产生**一个**目录修订，所有成员在该修订同时可见。
+    """
+    __tablename__ = "publish_batches"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True)
+    batch_id: Mapped[str] = mapped_column(String(128), unique=True, nullable=False,
+                                          index=True)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    revision_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("catalog_revisions.revision"), nullable=False)
+    members: Mapped[list] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class Plugin(Base):
     __tablename__ = "plugins"
-
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True)
     name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

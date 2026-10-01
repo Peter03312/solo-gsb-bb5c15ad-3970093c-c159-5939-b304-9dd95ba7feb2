@@ -11,21 +11,23 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
+import time
 
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from . import catalog, repository, service
 from .config import settings
 from .database import get_db
-from .models import CatalogRevision, Plugin, PluginVersion, Solution
+from .models import CatalogRevision, Plugin, PluginVersion, PublishBatch, Solution
 from .schemas import (
-    PreviewOut, PreviewRequest, PublishMetadata, RevisionOut, RevokeIn,
-    SolutionOut, SolveRequest, VersionOut,
+    BatchOut, PreviewOut, PreviewRequest, PublishMetadata, RevisionOut,
+    RevokeIn, SolutionOut, SolveRequest, VersionOut,
 )
 from .service import RequestError, SolutionNotFound, annotate_revoked
 from .solver import CycleError, UnsatisfiableError
@@ -127,6 +129,275 @@ async def publish(
 
     db.refresh(pv)
     return _version_out(db, pv)
+
+
+# ------------------------------------------------------------ 批次发布
+
+_PACKAGE_FIELD_RE = re.compile(r"^package(?::(\d+))?$")
+_MAX_BATCH_ITEMS = 1000
+
+
+def _cleanup_staged(db: Session, paths: list[str]) -> None:
+    """回滚后删除失败批次新建的包文件，但保留仍被已提交版本引用的内容。
+
+    并发同内容重试时，内容寻址文件可能已被提交的赢家引用；按 sha256
+    （内容寻址文件名即 sha256）复核后只删除无引用者，保证不破坏既有发布。
+    """
+    by_sha = {os.path.basename(p): p for p in paths}
+    try:
+        referenced = repository.sha256_referenced(db, list(by_sha))
+    except Exception:
+        # 无法判定引用关系时宁可保留（可能留下孤儿包），也绝不误删赢家/既有
+        # 发布正在引用的内容寻址文件。
+        return
+    for sha, path in by_sha.items():
+        if sha in referenced:
+            continue
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+        except OSError:
+            pass
+
+
+async def _read_upload_to_tmp(upload: UploadFile) -> tuple[str, bool]:
+    """流式落临时文件并执行大小上限；返回 (临时路径, 是否超限)。"""
+    fd, tmp_path = tempfile.mkstemp(prefix="batch-upload-", suffix=".pkg")
+    too_large = False
+    size = 0
+    with os.fdopen(fd, "wb") as out:
+        while True:
+            chunk = await upload.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > settings.max_upload_bytes:
+                too_large = True
+                break
+            out.write(chunk)
+    return tmp_path, too_large
+
+
+@router.post("/batches/{batch_id}/publish", response_model=BatchOut,
+             status_code=201, tags=["publish"])
+async def publish_batch(
+    batch_id: str,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+    authorization: str | None = Header(default=None),
+):
+    """整批发布：一个批次标识 + 多份“现有格式”的元数据与安装包。
+
+    multipart/form-data 字段：
+
+    * ``items``：发布元数据 **JSON 数组**，每一项与单版本发布 ``metadata``
+      完全同构（plugin/version/sha256/runtimes/dependencies/conflicts）；
+    * ``package``、``package:0``、``package:1`` ……：与数组顺序一一对应的
+      安装包；只给一个包时可直接用 ``package``。
+
+    全部成员校验通过才产生**一个**目录修订并同时可见；相同标识+相同内容
+    重试返回原结果（200/``cached=true``），标识相同内容不同返回 409。
+    """
+    _check_token(authorization)
+
+    try:
+        form = await request.form()
+    except Exception:
+        raise HTTPException(status_code=400, detail="请求不是合法的 multipart/form-data")
+
+    raw_items = form.get("items")
+    if raw_items is None:
+        raise HTTPException(
+            status_code=400,
+            detail="缺少 items 字段：发布元数据 JSON 数组（每项同单版本发布 metadata）")
+    try:
+        data_items = json.loads(raw_items)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="items 不是合法 JSON")
+    if not isinstance(data_items, list) or not data_items:
+        raise HTTPException(status_code=422,
+                            detail="items 必须是非空的发布元数据数组")
+    if len(data_items) > _MAX_BATCH_ITEMS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"批次成员超过上限 {_MAX_BATCH_ITEMS} 个")
+
+    metas: list[PublishMetadata] = []
+    for i, data in enumerate(data_items):
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=422,
+                                detail=f"items[{i}] 必须是 JSON 对象")
+        try:
+            metas.append(PublishMetadata(**data))
+        except ValueError as e:
+            raise HTTPException(
+                status_code=422,
+                detail={"index": i, "errors": _pydantic_errors(e)})
+
+    # package / package:<index> 收集；要求下标覆盖 0..n-1（单包可省略下标）
+    # 不做 isinstance 判断：不同 python-multipart/Starlette 版本下表单文件的
+    # 类身份不一致，按“文件类字段（有 filename）”鸭子识别即可。
+    indexed: dict[int, object] = {}
+    bare: list[object] = []
+    for key in form.keys():
+        m = _PACKAGE_FIELD_RE.match(key)
+        if not m:
+            continue
+        file_values = [v for v in form.getlist(key) if getattr(v, "filename", None)]
+        if m.group(1) is None:
+            bare.extend(file_values)
+        else:
+            if len(file_values) != 1 or len(form.getlist(key)) != 1:
+                raise HTTPException(
+                    status_code=400, detail=f"字段 {key} 只能提交一个安装包")
+            indexed[int(m.group(1))] = file_values[0]
+    n = len(metas)
+    if n == 1 and not indexed and len(bare) == 1:
+        files = [bare[0]]
+    else:
+        if bare:
+            raise HTTPException(
+                status_code=400,
+                detail="多项批次请使用 package:0、package:1 …… 与 items 下标一一对应")
+        if sorted(indexed) != list(range(n)):
+            raise HTTPException(
+                status_code=400,
+                detail=f"安装包字段 package:<i> 必须连续覆盖 0..{n - 1}，"
+                       f"实际下标：{sorted(indexed)}")
+        files = [indexed[i] for i in range(n)]
+
+    tmp_paths: list[str] = []
+    try:
+        for i, upload in enumerate(files):
+            tmp_path, too_large = await _read_upload_to_tmp(upload)
+            tmp_paths.append(tmp_path)
+            if too_large:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"第 {i} 项安装包超过上限 "
+                           f"{settings.max_upload_bytes} 字节")
+
+        try:
+            batch_id_ok = catalog.validate_batch_id(batch_id)
+        except catalog.PublishError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
+        content_hash = catalog.batch_content_hash(metas)
+        rev_no = members = staged_new = None
+        cached = False
+        # 并发同标识重试由 publish_batches 唯一约束在“批次幂等行 flush”处分
+        # 胜负（见 repository.publish_batch 的顺序：幂等行先于版本冲突检查）。
+        # 输家在该处或提交处收到 IntegrityError，SQLite 下还可能先撞写锁
+        # （OperationalError）。回滚后读既有批次行裁决：
+        #   * 同标识赢家已提交且内容相同 -> 返回原结果（cached）
+        #   * 同标识赢家已提交且内容不同 -> 409
+        #   * 赢家在途（批次行尚不可见）或数据库忙 -> 退避重试，直到见分晓
+        max_attempts = 30
+
+        def _settle_with_existing(staged):
+            """回滚后按既有批次行裁决；返回赢家结果元组，或 "retry"（赢家
+            在途/库忙）。内容不同直接抛 409。"""
+            existing = repository.get_batch(db, batch_id_ok)
+            if existing is None:
+                _cleanup_staged(db, staged)
+                return "retry"
+            if existing.content_hash != content_hash:
+                _cleanup_staged(db, staged)
+                raise HTTPException(
+                    status_code=409,
+                    detail=(f"批次标识 {batch_id_ok} 已用于不同内容的提交"
+                            f"（修订 {existing.revision_id}）"))
+            return (existing.revision_id, existing.members, True)
+
+        for attempt in range(max_attempts):
+            try:
+                rev_no, members, cached, staged_new = repository.publish_batch(
+                    db,
+                    batch_id=batch_id_ok,
+                    items=metas,
+                    src_paths=tmp_paths,
+                    original_filenames=[f.filename or "package.bin" for f in files],
+                    package_dir=settings.package_dir,
+                )
+                db.commit()
+                break
+            except catalog.BatchConflictError as e:
+                db.rollback()
+                _cleanup_staged(db, getattr(e, "staged_new", []))
+                raise HTTPException(status_code=409, detail=str(e))
+            except catalog.PublishError as e:
+                msg = str(e)
+                db.rollback()
+                # 幂等行先于版本检查：到这里的“不可改写”只可能是与不相干的
+                # 更早发布/另一批次撞名，是确定冲突（409），无需重试。其余为
+                # 摘要/范围/批内重复等单项校验失败（422）。错误均发生在落盘
+                # 之前；保险起见仍清理无引用的新建包。
+                _cleanup_staged(db, getattr(e, "staged_new", []))
+                status = 409 if ("不可改写" in msg) else 422
+                raise HTTPException(status_code=status, detail=msg)
+            except (IntegrityError, OperationalError):
+                db.rollback()
+                # 同标识竞争必在“批次行 flush”（落盘之前）就被唯一约束拦下，
+                # 因此一旦已经落过盘（staged_new 非空），这里的唯一冲突只能
+                # 来自插件/版本等其它表——即另一个不同标识的批次或单版本发布
+                # 已抢先占用某 (插件,版本)，属确定的不可改写（409），不再重试
+                # （重试也无意义：源文件已移入内容寻址存储，且赢家不会回滚）。
+                if staged_new:
+                    _cleanup_staged(db, staged_new)
+                    raise HTTPException(
+                        status_code=409,
+                        detail="批次中的某个插件版本已被并发发布占用，"
+                               "同名同版本不可改写；整个批次未生效")
+                settled = _settle_with_existing(staged_new or [])
+                if settled != "retry":
+                    rev_no, members, cached = settled
+                    break
+                # 赢家在途或库忙：退避后重读重投，下一轮必然见分晓
+                time.sleep(min(0.05 * (attempt + 1), 0.5))
+        else:
+            existing = repository.get_batch(db, batch_id_ok)
+            if existing is not None and existing.content_hash == content_hash:
+                rev_no, members, cached = (
+                    existing.revision_id, existing.members, True)
+            else:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"批次 {batch_id_ok} 并发竞争长时间未决，请稍后重试")
+    finally:
+        for upload in files:
+            await upload.close()
+        for p in tmp_paths:
+            if os.path.exists(p):
+                os.unlink(p)
+
+    row = repository.get_batch(db, batch_id_ok)
+    # 相同标识 + 相同内容重试：返回原结果，按 200（幂等命中）而非 201
+    response.status_code = 200 if cached else 201
+    return BatchOut(
+        batch_id=batch_id_ok,
+        revision=rev_no,
+        cached=cached,
+        content_hash=row.content_hash,
+        members=members,
+        created_at=row.created_at,
+    )
+
+
+@router.get("/batches/{batch_id}", response_model=BatchOut, tags=["publish"])
+def get_batch(batch_id: str, db: Session = Depends(get_db)):
+    """查询批次提交结果（读接口，始终开放）。不存在返回 404。"""
+    row = repository.get_batch(db, batch_id)
+    if row is None:
+        raise HTTPException(404, f"批次 {batch_id} 不存在")
+    return BatchOut(
+        batch_id=row.batch_id,
+        revision=row.revision_id,
+        cached=True,
+        content_hash=row.content_hash,
+        members=row.members,
+        created_at=row.created_at,
+    )
 
 
 # ------------------------------------------------------------ 撤销

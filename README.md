@@ -57,7 +57,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `plugindb` | 数据库凭据 |
 | `PACKAGE_DIR` | `/data/packages` | 安装包内容寻址存储根目录（按 sha256 前两位分桶） |
 | `MAX_UPLOAD_BYTES` | `1073741824`（1 GiB） | 单次上传大小上限 |
-| `API_TOKEN` | 空 | 非空时写接口（发布/撤销/求解）要求 `Authorization: Bearer <token>`；读接口始终开放 |
+| `API_TOKEN` | 空 | 非空时写接口（单版本发布/批次发布/撤销/求解）要求 `Authorization: Bearer <token>`；读接口始终开放 |
 | `API_PORT` | `8080` | 宿主机映射端口（compose） |
 
 ---
@@ -90,6 +90,67 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 版本范围支持 `==`（含 `1.2.*` 前缀）、`!=`、`>`、`>=`、`<`、`<=`、
 `~=`（兼容版本）、`===`，逗号表示交集；裸版本 `1.2.3` 等价 `==1.2.3`，
 空字符串 / `*` 表示不限。
+
+### 离线批次发布（多个相互依赖的插件一次交付）
+
+`POST /api/v1/batches/{batch_id}/publish`（multipart/form-data）
+
+一次离线交付常含相互依赖的多个插件版本，用**批次标识 `batch_id`**
+（字母/数字/`. _ -`，最长 128）把多份“现有格式”的元数据与安装包一起提交：
+
+- `items`：发布元数据 **JSON 数组**，每个元素与上面单版本发布的
+  `metadata` **完全同构**（plugin/version/sha256/runtimes/dependencies/
+  conflicts），各成员可在同批内互相依赖。
+- `package:0`、`package:1` ……：与 `items` 数组下标一一对应的安装包；
+  只有一个成员时可直接用 `package`。
+
+批次规则：
+
+- **批次内插件名 + 版本组合不得重复**（重复 → 422）。
+- 逐项沿用单版本发布规则：版本号/范围/SHA-256 校验、**同名同版本不可改写**。
+  任一项无效或与既有版本冲突 → 整批拒绝（422/409）。
+- **全部校验通过才生成一个目录修订**，所有成员在该修订**同时可见**；
+  修订之前一个成员都不可见。响应返回修订号与各成员结果。
+- 任一项无效、冲突，或存储/提交失败 → **整个批次不可见**，且**不会遗留仅由
+  失败批次引入的包文件**（内容寻址命中的既有包保留）。
+- **相同 `batch_id` + 相同内容重试**：返回首次结果（`200`、`cached=true`、
+  同一修订号），幂等不产生新修订；**标识相同而内容不同 → 409 冲突**。
+  内容比较与成员顺序无关（按插件名+版本规范化排序后计算内容哈希）。
+- **并发重试同一标识**由数据库唯一约束序列化，只能形成**一个修订**：赢家
+  `201`，其余同内容请求拿到 `cached=true` 的原结果。
+- 成功后可用 `GET /api/v1/batches/{batch_id}` 随时回查整批结果。
+
+curl 速览：
+
+```bash
+curl -X POST http://localhost:8080/api/v1/batches/lab-2026-10-01/publish \
+  -F 'items=[{"plugin":"numpy","version":"2.1.0","sha256":"<sha1>",
+              "runtimes":[{"name":"python","spec":">=3.10"}]},
+             {"plugin":"data-toolkit","version":"3.0.0","sha256":"<sha2>",
+              "dependencies":[{"plugin":"numpy","spec":">=2,<3"}]}];type=application/json' \
+  -F 'package:0=@numpy-2.1.0.bin' \
+  -F 'package:1=@data-toolkit-3.0.0.bin'
+```
+
+响应：
+
+```json
+{
+  "batch_id": "lab-2026-10-01",
+  "revision": 5,
+  "cached": false,
+  "content_hash": "…",
+  "members": [
+    {"plugin": "numpy", "version": "2.1.0", "sha256": "…",
+     "package_url": "/api/v1/plugins/numpy/versions/2.1.0/download",
+     "published_revision": 5},
+    {"plugin": "data-toolkit", "version": "3.0.0", "sha256": "…",
+     "package_url": "/api/v1/plugins/data-toolkit/versions/3.0.0/download",
+     "published_revision": 5}
+  ],
+  "created_at": "…"
+}
+```
 
 ### 求解
 
@@ -212,6 +273,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/plugins/{name}/versions` | 发布版本（multipart：`metadata` + `package`），201/409/422 |
+| POST | `/batches/{batch_id}/publish` | 离线批次发布（`items` JSON 数组 + `package:<i>` 多个包），整批一个修订；重试 200/冲突 409 |
+| GET  | `/batches/{batch_id}` | 查询批次结果（修订号与各成员） |
 | POST | `/plugins/{name}/versions/{ver}/revoke` | 撤销版本 |
 | POST | `/solutions` | 求解并保存方案；409 无解 / 422 依赖环 |
 | POST | `/solutions/{id}/preview` | 对已保存方案在目标修订上只读预演（最小变动优先，不保存） |
@@ -294,21 +357,27 @@ curl -X POST http://localhost:8080/api/v1/solutions/7/preview \
 核心版本规则、求解器与发布/撤销业务规则不依赖任何第三方库：
 
 ```bash
-python3 tests/test_solver.py        # 28 用例：PEP440、传递依赖、互斥、环、回溯、运行环境、确定性、最小变动预演
-python3 tests/test_catalog_flow.py  # 5 用例：发布校验/不可改写/摘要拒绝/快照/撤销语义/请求哈希（内存仓储）
+python3 tests/test_solver.py        # PEP440、传递依赖、互斥、环、回溯、运行环境、确定性、最小变动预演
+python3 tests/test_catalog_flow.py  # 发布校验/不可改写/摘要拒绝/快照/撤销/请求哈希 + 批次纯逻辑（内存）
 ```
 
 API 端到端测试（需要 FastAPI/SQLAlchemy 环境，可用内存 SQLite，无需起 PostgreSQL）：
 
 ```bash
 pip install -r requirements.txt httpx
-python3 tests/test_api.py          # 22 用例（含 9 个预演端到端用例）
+python3 tests/test_api.py          # 含批次发布端到端用例（原子性/幂等/冲突/清理/并发）
 ```
 
 覆盖：摘要不符拒绝、非法范围拒绝、同名同版本不可改写、传递求解与缓存、
 409 冲突明细不落部分方案、422 环、撤销只影响后续求解且历史方案带标记、
 下载校验头、互斥端到端，以及预演的 0 变动重放、覆盖换版、无解不保存、
 方案/修订/覆盖约束非法拒绝、发布撤销后同修订结果稳定等。
+
+批次发布额外覆盖：整批只产生一个修订且成员在该修订同时可见、相同标识相同
+内容重试返回原结果（200/cached）、标识相同内容不同 409、批内（插件,版本）
+重复拒绝、单项摘要/范围失败整批不可见且不留包文件、与既有版本冲突只清理
+本批新引入内容、下标缺包拒绝、批次后单版本发布兼容，以及 5 线程并发同一
+标识只形成一个修订。
 
 ---
 
@@ -319,14 +388,14 @@ app/
   main.py        # FastAPI 入口、建表与初始修订
   config.py      # 环境变量配置
   database.py    # 引擎 / 会话
-  models.py      # ORM：修订、插件、版本、依赖、运行环境、互斥、方案
+  models.py      # ORM：修订、批次、插件、版本、依赖、运行环境、互斥、方案
   schemas.py     # Pydantic 请求/响应模型与入参校验
   version.py     # PEP 440 版本与范围（标准库实现，无第三方依赖）
   solver.py      # 确定性回溯求解器（MRV + 冲突回溯 + 环检测）与最小变动预演、逐插件差异
-  catalog.py     # 纯领域逻辑：发布校验、SHA-256、请求规范化哈希
-  repository.py  # ORM 持久化：发布/撤销事务、修订快照、方案存取
+  catalog.py     # 纯领域逻辑：发布/批次校验、SHA-256、内容寻址落盘、请求与批次内容哈希
+  repository.py  # ORM 持久化：发布/批次发布/撤销事务、修订快照、方案存取
   service.py     # 求解编排与预演编排：覆盖合并、缓存、序列化、撤销标记
-  routers.py     # HTTP 路由（PostgreSQL REPEATABLE READ 只读快照事务）
+  routers.py     # HTTP 路由（PostgreSQL REPEATABLE READ 只读快照事务；批次并发幂等）
 examples/        # curl / Python 调用示例
 tests/           # 求解器单测、业务流内存测试、API 集成测试
 docker-compose.yml  Dockerfile  requirements.txt
@@ -341,6 +410,14 @@ docker-compose.yml  Dockerfile  requirements.txt
   与并发的发布/撤销事务完全隔离，方案不会跨修订拼装。
 - `solutions(revision_id, request_hash)` 唯一：相同输入在相同修订上复用
   同一方案，既保证“同请求同结果”，也自然消化并发重复求解。
+- 批次发布由 `publish_batches(batch_id)` 唯一表做幂等登记：事务内**先**占一个
+  修订并插入批次行（唯一约束 flush），**再**校验与既有版本的冲突并落盘建版本，
+  最后整批提交。因此同标识并发重试在批次行处分胜负，输家整事务回滚——整批
+  只产生一个修订，成员在该修订同时可见；同标识同内容的输家回滚后读取赢家结果
+  返回 `cached=true`，标识相同内容不同返回 409。版本冲突检查排在幂等行之后，
+  使得“走到版本检查仍命中已存在版本”只可能是不相干的更早发布（确定 409），
+  不再与同标识赢家竞争混淆。落盘在幂等行之后进行，提交前任何失败回滚后只删除
+  本次新建且无任何已提交版本引用的内容寻址文件，绝不遗留仅由失败批次引入的包。
 - 预演（`/solutions/{id}/preview`）复用同一快照加载与求解引擎，但运行在
   只读事务中并以回滚结束，**绝不写入方案或修订**；其结果只取决于
   （原方案、目标修订、合并后的有效请求），因此之后的发布/撤销不影响

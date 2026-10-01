@@ -83,6 +83,27 @@ class VersionOut(BaseModel):
     created_at: datetime
 
 
+# ----------------------------------------------------------- 批次发布
+
+class BatchMemberOut(BaseModel):
+    """批次内一个成员的结果（沿用单版本发布的名称/版本/SHA 规则）。"""
+    plugin: str
+    version: str
+    sha256: str
+    package_url: str
+    published_revision: int
+
+
+class BatchOut(BaseModel):
+    """一次批次发布的整体结果：全部成员共享同一个目录修订号。"""
+    batch_id: str
+    revision: int
+    cached: bool
+    content_hash: str
+    members: list[BatchMemberOut]
+    created_at: datetime
+
+
 # ----------------------------------------------------------- 求解
 
 class SolveRequest(BaseModel):

@@ -256,6 +256,67 @@ class MemoryFlowTests(unittest.TestCase):
         h2, _ = catalog.canonical_request(list(rt), {"b": "", "a": ">=1"})
         self.assertEqual(h1, h2)
 
+    # ------------------------------------------------------------ 批次纯逻辑
+    def test_batch_id_validation(self):
+        self.assertEqual(catalog.validate_batch_id("  lab-2026.10_1 "),
+                         "lab-2026.10_1")
+        for bad in ("", "has space", "中文", "a/b", "x" * 129):
+            with self.assertRaises(catalog.PublishError):
+                catalog.validate_batch_id(bad)
+
+    def test_batch_items_reject_empty_and_duplicate(self):
+        with self.assertRaises(catalog.PublishError):
+            catalog.validate_batch_items([])
+        path, sha = self._write_pkg("p")
+        items = [Meta("p", "1.0.0", sha), Meta("p", "1.0.0", sha)]
+        with self.assertRaises(catalog.PublishError):
+            catalog.validate_batch_items(items)
+        # 不同版本是合法的两个成员
+        items2 = [Meta("p", "1.0.0", sha), Meta("p", "2.0.0", sha)]
+        catalog.validate_batch_items(items2)  # 不抛即通过
+
+    def test_batch_items_propagate_single_item_validation(self):
+        path, sha = self._write_pkg("p")
+        # 非法版本号 / 非法范围 / 自身互斥，逐项沿用单版本发布校验
+        with self.assertRaises(catalog.PublishError):
+            catalog.validate_batch_items([Meta("p", "nope", sha)])
+        with self.assertRaises(catalog.PublishError):
+            catalog.validate_batch_items(
+                [Meta("p", "1.0.0", sha, dependencies=[("g", "~=1")])])
+        with self.assertRaises(catalog.PublishError):
+            catalog.validate_batch_items(
+                [Meta("p", "1.0.0", sha, conflicts=["p"])])
+
+    def test_batch_content_hash_order_independent_but_content_sensitive(self):
+        path, sha = self._write_pkg("p")
+        a = Meta("alpha", "1.0.0", sha)
+        b = Meta("beta", "1.0.0", sha)
+        self.assertEqual(catalog.batch_content_hash([a, b]),
+                         catalog.batch_content_hash([b, a]))
+        b2 = Meta("beta", "2.0.0", sha)
+        self.assertNotEqual(catalog.batch_content_hash([a, b]),
+                            catalog.batch_content_hash([a, b2]))
+        # 同一成员但依赖范围不同也视为不同内容
+        b3 = Meta("beta", "1.0.0", sha, dependencies=[("alpha", ">=1")])
+        self.assertNotEqual(catalog.batch_content_hash([a, b]),
+                            catalog.batch_content_hash([a, b3]))
+
+    def test_stage_package_reports_created_and_reuses(self):
+        path, sha = self._write_pkg("content-one")
+        final, size, created = catalog.stage_package_atomic(
+            path, sha, self.pkgdir)
+        self.assertTrue(created)
+        self.assertEqual(size, len("content-one"))
+        self.assertTrue(os.path.exists(final))
+        # 同内容再来一份：复用，不移动源文件，created=False
+        path2, _ = self._write_pkg("content-one")
+        final2, _, created2 = catalog.stage_package_atomic(
+            path2, sha, self.pkgdir)
+        self.assertEqual(final, final2)
+        self.assertFalse(created2)
+        self.assertTrue(os.path.exists(path2))  # 源文件未被移动
+        os.unlink(path2)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

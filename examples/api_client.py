@@ -51,6 +51,39 @@ class Client:
 
     # ------------------------------------------------------------ API
     def publish(self, meta: dict, payload: bytes):
+        return self._publish_one(f"/plugins/{meta['plugin']}/versions",
+                                 meta, payload)
+
+    def publish_batch(self, batch_id: str, members: list[tuple[dict, bytes]]):
+        """整批发布：members 为 (元数据, 安装包字节) 列表，按下标配对。
+
+        成功返回批次结果（含 revision/cached/members）；相同标识+相同内容
+        重试返回 cached=true 的原结果，标识相同内容不同为 HTTP 409。
+        """
+        boundary = "----lab" + uuid.uuid4().hex
+        buf = io.BytesIO()
+        buf.write(f"--{boundary}\r\n".encode())
+        buf.write(
+            b'Content-Disposition: form-data; name="items"\r\n'
+            b"Content-Type: application/json\r\n\r\n")
+        buf.write(json.dumps([m for m, _ in members],
+                             ensure_ascii=False).encode())
+        for i, (meta, payload) in enumerate(members):
+            field = "package" if len(members) == 1 else f"package:{i}"
+            filename = f"{meta['plugin']}-{meta['version']}.bin"
+            buf.write(f"\r\n--{boundary}\r\n".encode())
+            buf.write(
+                f'Content-Disposition: form-data; name="{field}"; '
+                f'filename="{filename}"\r\n'.encode())
+            buf.write(b"Content-Type: application/octet-stream\r\n\r\n")
+            buf.write(payload)
+        buf.write(f"\r\n--{boundary}--\r\n".encode())
+        return self._request(
+            "POST", f"/batches/{batch_id}/publish",
+            data=buf.getvalue(),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+
+    def _publish_one(self, path: str, meta: dict, payload: bytes):
         boundary = "----lab" + uuid.uuid4().hex
         buf = io.BytesIO()
         buf.write(f"--{boundary}\r\n".encode())
@@ -67,8 +100,7 @@ class Client:
         buf.write(payload)
         buf.write(f"\r\n--{boundary}--\r\n".encode())
         return self._request(
-            "POST", f"/plugins/{meta['plugin']}/versions",
-            data=buf.getvalue(),
+            "POST", path, data=buf.getvalue(),
             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
 
     def solve(self, req: dict):
@@ -89,6 +121,9 @@ class Client:
     def revisions(self):
         return self._request("GET", "/revisions")
 
+    def batch(self, batch_id: str):
+        return self._request("GET", f"/batches/{batch_id}")
+
 
 def show(title, status, payload):
     print(f"\n=== {title} [HTTP {status}] ===")
@@ -101,6 +136,50 @@ def main() -> int:
     ap.add_argument("--token", default=None)
     args = ap.parse_args()
     c = Client(args.base, args.token)
+
+    # ------------------------------------------------------------ 离线批次发布
+    # 相互依赖的 core + app 一次交付：只产生一个目录修订，成员同时可见
+    core_body = b"batch-core-1"
+    app_body = b"batch-app-1"
+    members = [
+        ({"plugin": "batch-core", "version": "1.0.0",
+          "sha256": hashlib.sha256(core_body).hexdigest(),
+          "runtimes": [], "dependencies": [], "conflicts": []}, core_body),
+        ({"plugin": "batch-app", "version": "1.0.0",
+          "sha256": hashlib.sha256(app_body).hexdigest(),
+          "dependencies": [{"plugin": "batch-core", "spec": ">=1"}],
+          "runtimes": [], "conflicts": []}, app_body),
+    ]
+    st, _, b = c.publish_batch("lab-batch-py", members)
+    show("批次发布 lab-batch-py（整批一个修订）", st, b)
+    assert st == 201 and b["cached"] is False
+    batch_rev = b["revision"]
+    assert all(m["published_revision"] == batch_rev for m in b["members"])
+
+    # 同标识 + 同内容重试：cached=true、同一修订
+    st, _, b2 = c.publish_batch("lab-batch-py", members)
+    show("批次重试（应 cached=true、同一修订）", st,
+         {"revision": b2["revision"], "cached": b2["cached"]})
+    assert st == 200 and b2["cached"] is True and b2["revision"] == batch_rev
+
+    # 成员在该修订同时可见
+    st, _, sol = c.solve({"revision": batch_rev,
+                          "targets": {"batch-app": ""}})
+    show(f"批次修订 {batch_rev} 上求解", st,
+         {"install_order": sol["install_order"]})
+    assert st == 200 and sol["install_order"] == ["batch-core", "batch-app"]
+
+    # 同标识、不同内容：409
+    diff_members = [members[0], (dict(members[1][0], version="2.0.0"), b"batch-app-2")]
+    st, _, err = c.publish_batch("lab-batch-py", diff_members)
+    show("批次标识相同内容不同（应 409）", st, err)
+    assert st == 409
+
+    # 回查批次
+    st, _, got = c.batch("lab-batch-py")
+    show("查询批次 lab-batch-py", st,
+         {"revision": got["revision"], "members": len(got["members"])})
+    assert st == 200 and got["revision"] == batch_rev
 
     def pub(plugin, version, runtimes, deps=None, conflicts=None, content=None):
         content = (content or f"{plugin}-{version}").encode()

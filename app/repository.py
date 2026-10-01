@@ -24,14 +24,14 @@ def _orm():
     """延迟加载 ORM 符号。"""
     from sqlalchemy import func, select
     from .models import (
-        CatalogRevision, Conflict, Dependency, Plugin, PluginVersion, Solution,
-        VersionRuntime,
+        CatalogRevision, Conflict, Dependency, Plugin, PluginVersion,
+        PublishBatch, Solution, VersionRuntime,
     )
     return SimpleNamespace(
         func=func, select=select, CatalogRevision=CatalogRevision,
         Conflict=Conflict, Dependency=Dependency, Plugin=Plugin,
-        PluginVersion=PluginVersion, Solution=Solution,
-        VersionRuntime=VersionRuntime,
+        PluginVersion=PluginVersion, PublishBatch=PublishBatch,
+        Solution=Solution, VersionRuntime=VersionRuntime,
     )
 
 
@@ -135,6 +135,161 @@ def revoke_version(db: Any, *, plugin_name: str, version: str,
     pv.revoke_reason = reason
     db.flush()
     return revision.revision
+
+
+# ---------------------------------------------------------------- 批次发布
+
+def get_batch(db: Any, batch_id: str):
+    o = _orm()
+    return db.execute(
+        o.select(o.PublishBatch).where(o.PublishBatch.batch_id == batch_id)
+    ).scalar_one_or_none()
+
+
+def sha256_referenced(db: Any, sha_values: Iterable[str]) -> set[str]:
+    """返回已提交版本行仍在引用（按内容 sha256）的子集。
+
+    批次失败清理包文件时必须保留这些内容：并发同内容重试的赢家可能已经
+    提交并指向同一个内容寻址文件。
+    """
+    values = list(sha_values)
+    if not values:
+        return set()
+    o = _orm()
+    rows = db.execute(
+        o.select(o.PluginVersion.sha256)
+        .where(o.PluginVersion.sha256.in_(values)).distinct()
+    ).all()
+    return {r[0] for r in rows}
+
+
+def publish_batch(db: Any, *, batch_id: str, items: list,
+                  src_paths: list[str], original_filenames: list[str],
+                  package_dir: str):
+    """整批一个事务：全部校验通过才落盘/写库并只产生**一个**目录修订。
+
+    成功返回 ``(revision_no, members, cached, staged_new)``；``staged_new``
+    为本次调用新建的包最终路径（缓存命中为空），供提交（commit）失败回滚后
+    精确删除。相同 ``batch_id`` + 相同内容重试返回首次结果（``cached=True``，
+    不产生新修订）；标识相同内容不同抛 :class:`catalog.BatchConflictError`。
+
+    任何校验失败都在落盘/写修订之前抛出；落盘后到提交前失败时，本函数负责
+    删除仅由本次批次新建的包文件（内容寻址命中的既有文件不动），保证不留
+    下仅由失败批次引入的包。
+    """
+    o = _orm()
+    catalog.validate_batch_id(batch_id)
+    catalog.validate_batch_items(items)
+    if len(items) != len(src_paths):
+        raise catalog.PublishError(
+            f"批次元数据 {len(items)} 项与安装包 {len(src_paths)} 个不一致")
+
+    existing_batch = get_batch(db, batch_id)
+    content_hash = catalog.batch_content_hash(items)
+    if existing_batch is not None:
+        if existing_batch.content_hash != content_hash:
+            raise catalog.BatchConflictError(
+                f"批次标识 {batch_id} 已用于不同内容的提交（修订 "
+                f"{existing_batch.revision_id}）；相同标识不得提交不同内容")
+        return existing_batch.revision_id, existing_batch.members, True, []
+
+    # 先复核全部 SHA-256（源文件尚在临时目录），任一不符即整体拒绝，
+    # 此时尚未落任何包、未写修订。并发重试时上一轮可能已把源文件移入内容
+    # 寻址存储（随后整事务回滚）：源不在但同 sha 的最终文件已在，则复核最终
+    # 文件即可；两者都不在才视为安装包缺失。
+    for meta, src in zip(items, src_paths):
+        final = os.path.join(package_dir, meta.sha256[:2], meta.sha256)
+        if not os.path.exists(src):
+            if os.path.exists(final):
+                catalog.verify_sha256(final, meta.sha256)
+                continue
+            raise catalog.PublishError(
+                f"{meta.plugin}=={meta.version} 的安装包在提交过程中丢失，请重新提交")
+        catalog.verify_sha256(src, meta.sha256)
+
+    # 关键：先占修订并**尽早插入批次幂等行**，再做与既有版本的冲突检查与落盘。
+    # 相同标识的并发重试在此由唯一约束立刻分胜负：输家整事务回滚，绝不会走到
+    # 下面的版本冲突检查，因此“走到版本检查仍命中已存在版本”只可能是与不相干
+    # 的更早发布（或另一个不同标识批次）撞名，属确定的不可改写冲突。
+    # 输掉时的修订号随回滚消失（PG 序列只留空洞，修订号仍单调）。
+    revision = bump_revision(db, kind="batch_publish", plugin=None,
+                             version=None, note=f"批次 {batch_id}")
+    rev_no = revision.revision
+    members = [{
+        "plugin": meta.plugin,
+        "version": meta.version,
+        "sha256": meta.sha256,
+        "package_url": (f"/api/v1/plugins/{meta.plugin}/versions/"
+                        f"{meta.version}/download"),
+        "published_revision": rev_no,
+    } for meta in items]
+    batch_row = o.PublishBatch(
+        batch_id=batch_id, content_hash=content_hash,
+        revision_id=rev_no, members=members)
+    db.add(batch_row)
+    db.flush()  # 同标识并发竞争在这里被唯一约束序列化
+
+    # 批内 (插件, 版本) 不重复（validate_batch_items 已保证）；
+    # 与已发布版本冲突则逐项给出同名同版本不可改写错误。走到这里时同标识竞争
+    # 已被上面的唯一约束排除，命中只可能是不相干的既有版本。
+    names = {m.plugin for m in items}
+    plugins = {p.name: p for p in db.execute(
+        o.select(o.Plugin).where(o.Plugin.name.in_(sorted(names)))).scalars()}
+    existing_versions: dict[str, set[str]] = {n: set() for n in names}
+    for pv, pname in db.execute(
+            o.select(o.PluginVersion, o.Plugin.name)
+            .join(o.Plugin, o.Plugin.id == o.PluginVersion.plugin_id)
+            .where(o.Plugin.name.in_(sorted(names)))).all():
+        existing_versions.setdefault(pname, set()).add(pv.version)
+    for meta in items:
+        if meta.version in existing_versions.get(meta.plugin, set()):
+            raise catalog.PublishError(
+                f"{meta.plugin}=={meta.version} 已发布，同名同版本不可改写；"
+                "批次内不允许改写既有版本")
+
+    # 内容寻址落盘；记录仅由本次新建的最终路径，失败时交给路由层回滚后清理。
+    staged_new: list[str] = []
+    try:
+        new_plugin_rows: dict[str, object] = dict(plugins)
+        for meta, src, filename in zip(items, src_paths, original_filenames):
+            final_path, size, created = catalog.stage_package_atomic(
+                src, meta.sha256, package_dir)
+            if created:
+                staged_new.append(final_path)
+
+            plugin = new_plugin_rows.get(meta.plugin)
+            if plugin is None:
+                plugin = o.Plugin(name=meta.plugin)
+                db.add(plugin)
+                db.flush()
+                new_plugin_rows[meta.plugin] = plugin
+            pv = o.PluginVersion(
+                plugin_id=plugin.id,
+                version=meta.version,
+                sha256=meta.sha256,
+                filename=os.path.basename(filename) or "package.bin",
+                size_bytes=size,
+                storage_path=final_path,
+                published_revision=rev_no,
+            )
+            db.add(pv)
+            db.flush()
+            for dep in meta.dependencies:
+                db.add(o.Dependency(source_id=pv.id, dep_plugin=dep.plugin,
+                                    spec=dep.spec or ""))
+            for rt in meta.runtimes:
+                db.add(o.VersionRuntime(version_id=pv.id, name=rt.name,
+                                        spec=rt.spec or ""))
+            for cname in meta.conflicts:
+                db.add(o.Conflict(source_id=pv.id, conflict_plugin=cname))
+    except BaseException as exc:
+        # 落盘后、提交前失败：不在事务内删除文件（此刻无法判断并发赢家是否
+        # 已引用同一内容）。把本次新建路径挂在异常上，由路由层回滚后用
+        # sha256_referenced 复核再安全清理，避免误删并发赢家的内容寻址文件。
+        exc.staged_new = staged_new  # type: ignore[attr-defined]
+        raise
+
+    return rev_no, members, False, staged_new
 
 
 # ---------------------------------------------------------------- 快照
