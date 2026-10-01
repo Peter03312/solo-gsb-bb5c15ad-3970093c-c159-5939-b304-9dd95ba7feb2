@@ -146,4 +146,72 @@ curl -sS -X POST "${AUTH[@]}" -H 'Content-Type: application/json' \
        \"targets\":{\"data-toolkit\":\">=3.1\"}}" \
   "$API/solutions/$SOL_ID/preview" | python3 -m json.tool || true
 
+# 12) 离线批次交付：相互依赖的多个版本一次提交，只产生一个目录修订
+echo ">>> 批次发布 batch-2026-10-01：pack-a + pack-b（b 依赖 a）同时可见"
+batch_dir="$tmpdir/batch"
+mkdir -p "$batch_dir"
+batch_member() {
+  local idx="$1" plugin="$2" version="$3" meta="$4" content="$5"
+  local pkg="$batch_dir/pkg-$idx.bin"
+  printf '%s' "$content" > "$pkg"
+  local sha; sha="$(sha256_file "$pkg")"
+  SHA="$sha" python3 -c '
+import json,os,sys
+m=json.loads(sys.argv[1]); m["sha256"]=os.environ["SHA"]
+open(sys.argv[2],"w").write(json.dumps(m, ensure_ascii=False))
+' "$meta" "$batch_dir/meta-$idx.json"
+  echo "$pkg|$plugin-$version.bin"
+}
+mapfile -t PARTS < <(
+  batch_member 1 pack-a 1.0.0 \
+    '{"plugin":"pack-a","version":"1.0.0",
+      "runtimes":[{"name":"python","spec":">=3.10"}]}' \
+    "pack-a-1.0.0-payload"
+  batch_member 2 pack-b 1.0.0 \
+    '{"plugin":"pack-b","version":"1.0.0",
+      "runtimes":[{"name":"python","spec":">=3.10"}],
+      "dependencies":[{"plugin":"pack-a","spec":">=1"}]}' \
+    "pack-b-1.0.0-payload"
+)
+curl -fsS -X POST "${AUTH[@]}" \
+  -F "batch_id=batch-2026-10-01" \
+  -F "metadata=<$batch_dir/meta-1.json;type=application/json" \
+  -F "package=@${PARTS[0]%%|*};filename=${PARTS[0]##*|}" \
+  -F "metadata=<$batch_dir/meta-2.json;type=application/json" \
+  -F "package=@${PARTS[1]%%|*};filename=${PARTS[1]##*|}" \
+  "$API/batches" | tee "$tmpdir/batch.json" | python3 -m json.tool
+
+BATCH_REV="$(python3 -c 'import json;print(json.load(open("'$tmpdir'/batch.json"))["revision"])')"
+echo ">>> 批次只产生一个修订 $BATCH_REV，两个成员在该修订可一起求解"
+curl -fsS -X POST "${AUTH[@]}" -H 'Content-Type: application/json' \
+  -d "{\"revision\":$BATCH_REV,\"targets\":{\"pack-b\":\"\"}}" \
+  "$API/solutions" | python3 -m json.tool
+
+# 13) 相同批次标识 + 相同内容重试 -> 200 cached=true，返回原修订号
+echo ">>> 批次重试（应 cached=true，修订号不变）"
+curl -fsS -X POST "${AUTH[@]}" \
+  -F "batch_id=batch-2026-10-01" \
+  -F "metadata=<$batch_dir/meta-2.json;type=application/json" \
+  -F "package=@${PARTS[1]%%|*};filename=${PARTS[1]##*|}" \
+  -F "metadata=<$batch_dir/meta-1.json;type=application/json" \
+  -F "package=@${PARTS[0]%%|*};filename=${PARTS[0]##*|}" \
+  "$API/batches" | python3 -c 'import json,sys;b=json.load(sys.stdin);
+print("revision:",b["revision"],"cached:",b["cached"])'
+
+# 14) 按批次标识查询原结果
+echo ">>> 查询批次 batch-2026-10-01"
+curl -fsS "$API/batches/batch-2026-10-01" \
+  | python3 -c 'import json,sys;b=json.load(sys.stdin);
+print("members:",[(m["plugin"],m["version"]) for m in b["members"]])'
+
+# 15) 相同批次标识但内容不同 -> 409 batch_conflict
+echo ">>> 同号不同内容（应 409）"
+curl -sS -X POST "${AUTH[@]}" \
+  -F "batch_id=batch-2026-10-01" \
+  -F "metadata=<$batch_dir/meta-1.json;type=application/json" \
+  -F "package=@${PARTS[0]%%|*};filename=pack-a-1.0.0.bin" \
+  -F "metadata=<$batch_dir/meta-2.json;type=application/json" \
+  -F "package=@${PARTS[0]%%|*};filename=pack-b-1.0.0.bin" \
+  "$API/batches" | python3 -m json.tool || true
+
 echo "全部示例执行完成。"

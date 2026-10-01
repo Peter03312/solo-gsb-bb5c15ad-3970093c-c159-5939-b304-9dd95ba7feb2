@@ -204,6 +204,48 @@ class RevokeIn(BaseModel):
     reason: str | None = None
 
 
+# ----------------------------------------------------------- 批次发布
+
+BATCH_ID_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$")
+
+
+def validate_batch_id(batch_id: str) -> str:
+    batch_id = (batch_id or "").strip()
+    if not batch_id or len(batch_id) > 128 or not BATCH_ID_RE.match(batch_id):
+        raise ValueError(
+            "批次标识只允许字母、数字、. _ -，且首尾必须是字母或数字（最长 128）")
+    return batch_id
+
+
+class BatchMemberOut(BaseModel):
+    """批次中一个成员的发布结果（与单版本发布 VersionOut 同字段，外加下载地址）。"""
+    index: int
+    plugin: str
+    version: str
+    sha256: str
+    filename: str
+    size_bytes: int
+    runtimes: list[RuntimeIn]
+    dependencies: list[DependencyIn]
+    conflicts: list[str]
+    package_url: str
+    published_revision: int
+    revoked_revision: int | None = None
+    revoke_reason: str | None = None
+    revoked: bool = False
+
+
+class BatchOut(BaseModel):
+    """一次批次交付的完整结果。"""
+    batch_id: str
+    revision: int
+    cached: bool
+    content_hash: str
+    member_count: int
+    members: list[BatchMemberOut]
+    created_at: datetime
+
+
 class OkOut(BaseModel):
     ok: bool = True
     message: str

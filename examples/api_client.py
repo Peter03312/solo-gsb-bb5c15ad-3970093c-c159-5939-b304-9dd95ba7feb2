@@ -71,6 +71,37 @@ class Client:
             data=buf.getvalue(),
             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
 
+    def publish_batch(self, batch_id: str, members: list[tuple[dict, bytes]]):
+        """离线批次交付：members 为 [(metadata, payload), ...]，顺序即提交顺序。"""
+        boundary = "----labbatch" + uuid.uuid4().hex
+        buf = io.BytesIO()
+
+        def write_field(name, value: bytes, content_type="application/json",
+                       filename=None):
+            disp = f'Content-Disposition: form-data; name="{name}"'
+            if filename:
+                disp += f'; filename="{filename}"'
+            buf.write(f"--{boundary}\r\n".encode())
+            buf.write(disp.encode() + b"\r\n")
+            buf.write(f"Content-Type: {content_type}\r\n\r\n".encode())
+            buf.write(value if isinstance(value, bytes) else value.encode())
+            buf.write(b"\r\n")
+
+        write_field("batch_id", batch_id, content_type="text/plain")
+        for meta, payload in members:
+            write_field("metadata", json.dumps(meta, ensure_ascii=False))
+            filename = f"{meta['plugin']}-{meta['version']}.bin"
+            write_field("package", payload,
+                        content_type="application/octet-stream",
+                        filename=filename)
+        buf.write(f"--{boundary}--\r\n".encode())
+        return self._request(
+            "POST", "/batches", data=buf.getvalue(),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+
+    def batch(self, batch_id: str):
+        return self._request("GET", f"/batches/{batch_id}")
+
     def solve(self, req: dict):
         return self._request("POST", "/solutions", data=req)
 
@@ -226,6 +257,56 @@ def main() -> int:
     st, _, body = c.publish(bad, b"different-content")
     show("摘要不符（应 422 拒绝）", st, body)
     assert st == 422
+
+    # ------------------------------------------------------------ 批次发布
+    # 相互依赖的两个版本一次交付：只产生一个目录修订，成员同时可见
+    b_lib = ({"plugin": "batch-lib", "version": "1.0.0",
+              "sha256": hashlib.sha256(b"batchlib").hexdigest(),
+              "runtimes": [], "dependencies": [], "conflicts": []}, b"batchlib")
+    b_app = ({"plugin": "batch-app", "version": "1.0.0",
+              "sha256": hashlib.sha256(b"batchapp").hexdigest(),
+              "runtimes": [],
+              "dependencies": [{"plugin": "batch-lib", "spec": ">=1"}],
+              "conflicts": []}, b"batchapp")
+
+    st, _, b1 = c.publish_batch("batch-demo-001", [b_lib, b_app])
+    show("批次发布（201，单修订、两成员）", st, {
+        "revision": b1["revision"], "cached": b1["cached"],
+        "members": [(m["plugin"], m["version"]) for m in b1["members"]]})
+    assert st == 201 and len(b1["members"]) == 2
+    batch_rev = b1["revision"]
+
+    # 在批次修订上求解，两个相互依赖成员都应可见
+    st, _, bs = c.solve({"revision": batch_rev, "targets": {"batch-app": ""}})
+    show("批次修订上求解", st, {"install_order": bs["install_order"]})
+    assert st == 200 and bs["install_order"] == ["batch-lib", "batch-app"]
+
+    # 相同标识 + 相同内容重试（顺序调换也一样）-> 200 cached=true
+    st, _, b2 = c.publish_batch("batch-demo-001", [b_app, b_lib])
+    show("批次重试（200 cached=true，修订号不变）", st, {
+        "revision": b2["revision"], "cached": b2["cached"]})
+    assert st == 200 and b2["cached"] is True
+    assert b2["revision"] == batch_rev
+
+    # 按标识查询原结果
+    st, _, b3 = c.batch("batch-demo-001")
+    show("按批次标识查询", st, {"revision": b3["revision"],
+                               "count": b3["member_count"]})
+    assert st == 200 and b3["revision"] == batch_rev
+
+    # 相同标识 + 不同内容 -> 409
+    b_app_conflict = dict(b_app[0]), b"totally-different-payload"
+    b_app_conflict[0]["sha256"] = hashlib.sha256(
+        b"totally-different-payload").hexdigest()
+    st, _, berr = c.publish_batch(
+        "batch-demo-001", [b_lib, b_app_conflict])
+    show("批次同号不同内容（409 batch_conflict）", st, berr)
+    assert st == 409 and berr["detail"]["code"] == "batch_conflict"
+
+    # 批次内 (插件,版本) 重复 -> 409
+    st, _, berr = c.publish_batch("batch-demo-dup", [b_lib, b_lib])
+    show("批次内重复成员（409）", st, berr)
+    assert st == 409
 
     print("\n全部示例断言通过。")
     return 0

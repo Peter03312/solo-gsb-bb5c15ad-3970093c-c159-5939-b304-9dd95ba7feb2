@@ -39,11 +39,31 @@ class CatalogRevision(Base):
 
     revision: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    # publish / revoke
+    # publish / batch / revoke / init
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
     plugin: Mapped[str | None] = mapped_column(String(128), nullable=True)
     version: Mapped[str | None] = mapped_column(String(128), nullable=True)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class PublishBatch(Base):
+    """一次离线批次交付：客户端提供的批次号 + 规范化内容哈希。
+
+    * batch_id 为主键：相同批次号的并发提交在本行上串行化，只能形成一个
+      目录修订（后到者读到先提交者的原结果）。
+    * content_hash 与 batch_id 同时确定：同号必须同内容，否则 409。
+    * revision_id 唯一：一个批次至多对应一个目录修订；批次内全部成员的
+      published_revision 都等于该修订号，因而同时可见。
+    """
+    __tablename__ = "publish_batches"
+
+    batch_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    revision_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("catalog_revisions.revision"),
+        nullable=True, unique=True)
+    member_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class Plugin(Base):

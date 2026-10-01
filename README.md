@@ -57,7 +57,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `plugindb` | 数据库凭据 |
 | `PACKAGE_DIR` | `/data/packages` | 安装包内容寻址存储根目录（按 sha256 前两位分桶） |
 | `MAX_UPLOAD_BYTES` | `1073741824`（1 GiB） | 单次上传大小上限 |
-| `API_TOKEN` | 空 | 非空时写接口（发布/撤销/求解）要求 `Authorization: Bearer <token>`；读接口始终开放 |
+| `API_TOKEN` | 空 | 非空时写接口（单版本发布/批次发布/撤销/求解）要求 `Authorization: Bearer <token>`；读接口（含批次查询）始终开放 |
 | `API_PORT` | `8080` | 宿主机映射端口（compose） |
 
 ---
@@ -90,6 +90,66 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 版本范围支持 `==`（含 `1.2.*` 前缀）、`!=`、`>`、`>=`、`<`、`<=`、
 `~=`（兼容版本）、`===`，逗号表示交集；裸版本 `1.2.3` 等价 `==1.2.3`，
 空字符串 / `*` 表示不限。
+
+### 离线批次交付（多版本同时可见）
+
+`POST /api/v1/batches`（multipart/form-data）
+
+一次实验室离线交付常含相互依赖的多个插件版本。批次接口接收一个**批次标识**
+`batch_id` 与**多份**现有格式的发布元数据和安装包（`metadata` 与 `package`
+按出现顺序一一配对，可重复任意次）：
+
+- `batch_id`：客户端批次标识（字母数字、`._-`，最长 128）；
+- `metadata`：若干份 JSON 字符串，字段与单版本发布完全一致；
+- `package`：若干个安装包文件，份数与顺序必须与 `metadata` 对齐。
+
+批次规则（逐项沿用单版本发布语义）：
+
+- **全部校验通过才生成一个目录修订**：批次内所有成员共享同一
+  `published_revision`，因而在该修订**同时可见**；批次之外的任何旧修订
+  都看不到它们；
+- 批次内**插件名与版本组合不得重复** → 409；
+- 逐成员执行名称、版本范围、运行环境范围、互斥自身等校验，服务端重新计算
+  每份安装包的 **SHA-256**；任一项无效或摘要不符 → **422**；
+- 任一成员**同名同版本已发布（即使已撤销）不可改写** → **409**；
+- 任一项无效/冲突、或存储及事务提交失败 → **整个批次不可见**：无修订、
+  无版本行，且**不得遗留仅由失败批次引入的包文件**（内容寻址存储中已被
+  其它成功发布引用的文件保留）；
+- **相同批次标识 + 相同内容重试**（成员顺序不同也算相同）→ 返回**原结果**
+  （200，`cached=true`，原修订号与各成员结果），可用
+  `GET /api/v1/batches/{batch_id}` 随时查询；
+- **相同批次标识 + 不同内容** → **409** `batch_conflict`；
+- **并发同号重试只能形成一个修订**：批次表以 `batch_id` 为主键串行化，
+  唯一赢家提交，其余事务重读赢家结果返回 200。
+
+响应示例：
+
+```json
+{
+  "batch_id": "batch-2026-10-01",
+  "revision": 16,
+  "cached": false,
+  "content_hash": "7d2f…",
+  "member_count": 2,
+  "members": [
+    {"index": 1, "plugin": "pack-a", "version": "1.0.0", "sha256": "…",
+     "filename": "pack-a-1.0.0.bin", "size_bytes": 19,
+     "runtimes": [{"name": "python", "spec": ">=3.10"}],
+     "dependencies": [], "conflicts": [],
+     "package_url": "/api/v1/plugins/pack-a/versions/1.0.0/download",
+     "published_revision": 16, "revoked_revision": null,
+     "revoke_reason": null, "revoked": false},
+    {"index": 2, "plugin": "pack-b", "version": "1.0.0", "…": "…"}
+  ],
+  "created_at": "2026-10-01T08:00:00Z"
+}
+```
+
+批次修订在 `/revisions` 中显示为 `kind="batch"`、`note` 为批次标识。
+批次成员与单版本发布的版本行完全同构：求解、历史修订、撤销、下载等既有
+行为对其一视同仁，无需任何改动。响应中 `members` 按 (插件名, 版本)
+**确定性排序**（与提交顺序无关，重试结果逐字节一致），每项含独立的
+`package_url` 与撤销标记，可直接逐项下载。
 
 ### 求解
 
@@ -212,6 +272,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/plugins/{name}/versions` | 发布版本（multipart：`metadata` + `package`），201/409/422 |
+| POST | `/batches` | 批次交付（multipart：`batch_id` + 多对 `metadata`/`package`），201/200/409/422 |
+| GET  | `/batches/{batch_id}` | 按批次标识查询原结果（修订号与各成员结果） |
 | POST | `/plugins/{name}/versions/{ver}/revoke` | 撤销版本 |
 | POST | `/solutions` | 求解并保存方案；409 无解 / 422 依赖环 |
 | POST | `/solutions/{id}/preview` | 对已保存方案在目标修订上只读预演（最小变动优先，不保存） |
@@ -252,7 +314,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 启动服务后任选其一：
 
 ```bash
-# bash + curl：发布、求解、缓存、无解、撤销、历史查询、旧修订重放、下载、方案预演
+# bash + curl：发布、批次交付、求解、缓存、无解、撤销、历史查询、旧修订重放、下载、方案预演
 BASE=http://localhost:8080 bash examples/api-examples.sh
 
 # 纯标准库 Python（离线机器无需安装 requests）
@@ -274,6 +336,19 @@ curl -X POST http://localhost:8080/api/v1/plugins/data-toolkit/versions \
       \"conflicts\":[]};type=application/json" \
   -F "package=@/tmp/dtk.bin"
 
+# 批次交付：多份现有格式的元数据 + 多个包，按序配对，只产生一个目录修订
+printf 'pack-a' > /tmp/pack-a.bin; SHA_A=$(sha256sum /tmp/pack-a.bin | awk '{print $1}')
+printf 'pack-b' > /tmp/pack-b.bin; SHA_B=$(sha256sum /tmp/pack-b.bin | awk '{print $1}')
+curl -X POST http://localhost:8080/api/v1/batches \
+  -F "batch_id=batch-2026-10-01" \
+  -F "metadata={\"plugin\":\"pack-a\",\"version\":\"1.0.0\",\"sha256\":\"$SHA_A\"};type=application/json" \
+  -F "package=@/tmp/pack-a.bin" \
+  -F "metadata={\"plugin\":\"pack-b\",\"version\":\"1.0.0\",\"sha256\":\"$SHA_B\",
+      \"dependencies\":[{\"plugin\":\"pack-a\",\"spec\":\">=1\"}]};type=application/json" \
+  -F "package=@/tmp/pack-b.bin"
+# 同 batch_id 同内容重试 -> 200 cached=true；同号不同内容 -> 409
+curl http://localhost:8080/api/v1/batches/batch-2026-10-01
+
 # 求解
 curl -X POST http://localhost:8080/api/v1/solutions \
   -H 'Content-Type: application/json' \
@@ -294,21 +369,26 @@ curl -X POST http://localhost:8080/api/v1/solutions/7/preview \
 核心版本规则、求解器与发布/撤销业务规则不依赖任何第三方库：
 
 ```bash
-python3 tests/test_solver.py        # 28 用例：PEP440、传递依赖、互斥、环、回溯、运行环境、确定性、最小变动预演
-python3 tests/test_catalog_flow.py  # 5 用例：发布校验/不可改写/摘要拒绝/快照/撤销语义/请求哈希（内存仓储）
+python3 tests/test_solver.py        # 30 用例：PEP440、传递依赖、互斥、环、回溯、运行环境、确定性、最小变动预演
+python3 tests/test_catalog_flow.py  # 11 用例：发布校验/不可改写/摘要拒绝/快照/撤销语义/请求哈希/批次原子性与幂等（内存仓储）
 ```
 
 API 端到端测试（需要 FastAPI/SQLAlchemy 环境，可用内存 SQLite，无需起 PostgreSQL）：
 
 ```bash
 pip install -r requirements.txt httpx
-python3 tests/test_api.py          # 22 用例（含 9 个预演端到端用例）
+python3 tests/test_api.py          # 37 用例（含 9 个预演端到端用例、14 个批次端到端用例）
 ```
 
 覆盖：摘要不符拒绝、非法范围拒绝、同名同版本不可改写、传递求解与缓存、
 409 冲突明细不落部分方案、422 环、撤销只影响后续求解且历史方案带标记、
 下载校验头、互斥端到端，以及预演的 0 变动重放、覆盖换版、无解不保存、
-方案/修订/覆盖约束非法拒绝、发布撤销后同修订结果稳定等。
+方案/修订/覆盖约束非法拒绝、发布撤销后同修订结果稳定等；批次覆盖
+**多成员单修订同时可见、相互依赖立即可解、同号同内容幂等（含乱序）、
+同号异内容 409、批次内重复 409、与既有版本冲突整批不可见、SHA-256/范围
+非法整批拒绝、落盘后失败回滚且孤儿包文件回收（含保留被引用的同哈希文件）、
+成员只在批次修订可见、批次成员撤销、并发同号重试只形成一个修订**、
+与单版本发布/求解/下载交错兼容。
 
 ---
 
@@ -319,12 +399,12 @@ app/
   main.py        # FastAPI 入口、建表与初始修订
   config.py      # 环境变量配置
   database.py    # 引擎 / 会话
-  models.py      # ORM：修订、插件、版本、依赖、运行环境、互斥、方案
+  models.py      # ORM：修订、批次、插件、版本、依赖、运行环境、互斥、方案
   schemas.py     # Pydantic 请求/响应模型与入参校验
   version.py     # PEP 440 版本与范围（标准库实现，无第三方依赖）
   solver.py      # 确定性回溯求解器（MRV + 冲突回溯 + 环检测）与最小变动预演、逐插件差异
-  catalog.py     # 纯领域逻辑：发布校验、SHA-256、请求规范化哈希
-  repository.py  # ORM 持久化：发布/撤销事务、修订快照、方案存取
+  catalog.py     # 纯领域逻辑：发布校验、SHA-256、请求/批次规范化哈希、失败孤儿回收
+  repository.py  # ORM 持久化：发布/批次/撤销事务、修订快照、方案存取
   service.py     # 求解编排与预演编排：覆盖合并、缓存、序列化、撤销标记
   routers.py     # HTTP 路由（PostgreSQL REPEATABLE READ 只读快照事务）
 examples/        # curl / Python 调用示例
@@ -337,8 +417,21 @@ docker-compose.yml  Dockerfile  requirements.txt
 - `catalog_revisions` 是一张只追加的修订表（自增主键即修订号）。
 - 每个版本记录 `published_revision` 与 `revoked_revision`：
   在修订 R 可见 ⇔ `published_revision <= R < revoked_revision`（未撤销则右端为空）。
+- **批次发布只追加一个 `kind="batch"` 的修订行**：事务内全部成员校验
+  （名称/范围/SHA-256/不可改写/批次内不重复）与内容寻址落盘完成后才取
+  修订号，所有成员写入同一个 `published_revision`，所以要么整批在新修订
+  同时可见，要么回滚后在任何修订都不可见。
+- `publish_batches` 以 **`batch_id` 为主键**记录内容哈希与修订号：
+  并发同号提交在该行上由数据库串行化，唯一冲突者获胜并提交，其余事务
+  回滚后按内容哈希判定——同内容重读赢家结果（200 幂等），不同内容
+  返回 409；因此并发重试至多形成一个修订。批次内容哈希由逐成员
+  （插件、版本、SHA-256、规范化运行环境/依赖/互斥项）按 (插件, 版本)
+  排序计算，成员提交顺序不影响“相同内容”判定。
+- **失败不留垃圾**：包文件按 SHA-256 内容寻址，落盘与数据库提交分离；
+  批次失败回滚后只删除“本次尝试新建、且回滚后数据库中再无任何版本行
+  引用”的文件——已被其它成功发布引用的同哈希文件保留。
 - 求解在 **REPEATABLE READ** 事务中先确定修订号，再加载快照、求解、写方案；
-  与并发的发布/撤销事务完全隔离，方案不会跨修订拼装。
+  与并发的发布/撤销/批次事务完全隔离，方案不会跨修订拼装。
 - `solutions(revision_id, request_hash)` 唯一：相同输入在相同修订上复用
   同一方案，既保证“同请求同结果”，也自然消化并发重复求解。
 - 预演（`/solutions/{id}/preview`）复用同一快照加载与求解引擎，但运行在
